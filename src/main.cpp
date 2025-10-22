@@ -5,9 +5,9 @@ const uint8_t PIN_EDGE_A = 2;   // Comparator A -> D2 (master)
 const uint8_t PIN_EDGE_B = 3;   // Comparator B -> D3 (slave)
 
 const uint8_t MASTER_PWM = 5;   // Motor A PWM
-const uint8_t MASTER_DIR = 4;   // Motor A DIR (HIGH = forward)
+const uint8_t MASTER_DIR = 4;   // Motor A DIR (forward level as wired)
 const uint8_t SLAVE_PWM  = 6;   // Motor B PWM
-const uint8_t SLAVE_DIR  = 7;   // Motor B DIR (HIGH = forward)
+const uint8_t SLAVE_DIR  = 7;   // Motor B DIR (forward level as wired)
 
 // ===== Fixed settings =====
 const uint8_t MASTER_PWM_BASE = 90;  // open-loop base for master (0..255)
@@ -16,13 +16,31 @@ const uint8_t SLAVE_PWM_MIN   = 20;  // helps overcome static friction
 const uint8_t SLAVE_PWM_MAX   = 255;
 
 const uint16_t EDGE_LOCKOUT_US = 100;   // ignore edges that are too close
-const uint32_t CTRL_DT_US      = 100;  // 1 kHz control loop
+const uint32_t CTRL_DT_US      = 100;   // control loop period (µs)
 
 // ===== Controller gains (tune these) =====
 // PWM correction = Kp * (Δt in us) + Ki * ∫(Δt in us)*dt
 // If slave lags (Δt>0), PWM will increase; if it leads (Δt<0), PWM will decrease.
 float Kp = 0.0020f;      // counts per microsecond (e.g., 0.002 * 500us = 1 PWM count)
 float Ki = 0.0005f;      // counts per microsecond per second
+
+// ===== Desired phase offset =====
+// Set the desired phase difference between A and B.
+// You can set either cycles or degrees; both write the same variable.
+volatile float phaseOffset_cycles = 0.25f;  // 0.0 = in-phase; +0.25 = +90°; +0.5 = 180°; range (-0.5..+0.5)
+
+// Helper setters (call from elsewhere if you want to change at runtime)
+inline void setPhaseOffsetCycles(float cyc) {
+  noInterrupts();
+  // wrap to (-0.5, +0.5]
+  while (cyc >  0.5f) cyc -= 1.0f;
+  while (cyc <= -0.5f) cyc += 1.0f;
+  phaseOffset_cycles = cyc;
+  interrupts();
+}
+inline void setPhaseOffsetDegrees(float deg) {
+  setPhaseOffsetCycles(deg / 360.0f);
+}
 
 // ===== ISR state =====
 volatile uint32_t tA = 0, pA = 0, perA = 0;
@@ -52,7 +70,7 @@ static inline int32_t wrapHalfPeriod(int32_t e_us, uint32_t T_us) {
 }
 
 void setup() {
-  // Directions fixed forward
+  // Directions fixed (keep your chosen forward level)
   pinMode(MASTER_DIR, OUTPUT);
   pinMode(SLAVE_DIR,  OUTPUT);
   digitalWrite(MASTER_DIR, LOW);
@@ -69,6 +87,9 @@ void setup() {
   pinMode(PIN_EDGE_B, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_EDGE_A), isrA, RISING);
   attachInterrupt(digitalPinToInterrupt(PIN_EDGE_B), isrB, RISING);
+
+  // Example: set a 90° phase lead for A relative to B
+  //setPhaseOffsetDegrees(90.0f);   // comment/uncomment as needed
 }
 
 void loop() {
@@ -84,6 +105,7 @@ void loop() {
     noInterrupts();
     uint32_t TA = tA, TB = tB;
     uint32_t T  = perA ? perA : perB; // prefer master period if available
+    float    off_cyc = phaseOffset_cycles;
     interrupts();
 
     // If we don't have valid edges yet, relax toward base and decay integral
@@ -98,8 +120,11 @@ void loop() {
       return;
     }
 
-    // Phase error in microseconds (A leads positive), wrapped to ±T/2
-    int32_t e_us = (int32_t)(TA - TB);
+    // Desired offset in microseconds based on current period
+    int32_t desired_offset_us = (int32_t)(off_cyc * (float)T);
+
+    // Phase error in microseconds (A leads positive), relative to desired offset
+    int32_t e_us = (int32_t)(TA - TB) - desired_offset_us;
     e_us = wrapHalfPeriod(e_us, T);
 
     // PI on time error
